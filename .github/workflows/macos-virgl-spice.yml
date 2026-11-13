@@ -194,7 +194,7 @@ jobs:
 
           Q="$DIST_DIR/qemu/bin/qemu-system-aarch64"
           "$Q" -L "$DIST_DIR/qemu/share/qemu" --version
-          "$Q" -L "$DIST_DIR/qemu/share/qemu" -spice help > "$DIST_DIR/spice-help.txt" 2>&1
+          "$Q" -L "$DIST_DIR/qemu/share/qemu" -spice help > "$DIST_DIR/spice-help.txt" 2>&1 || true
           grep -q 'port' "$DIST_DIR/spice-help.txt"
           "$Q" -L "$DIST_DIR/qemu/share/qemu" -device help > "$DIST_DIR/device-help.txt"
           grep -q 'virtio-gpu-gl-pci' "$DIST_DIR/device-help.txt"
