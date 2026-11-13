@@ -5,7 +5,7 @@ name: macOS arm64 QEMU (VirGL + Venus + SPICE)
 #   - Cocoa display + HVF
 #   - virtio-gpu-gl-pci / virglrenderer / ANGLE (GL/GLES over Metal)
 #   - Venus Vulkan (provided by the virglrenderer bottle)
-#   - SPICE server + QXL
+#   - SPICE server (QXL where the QEMU target exposes it; arm64 uses virtio-gpu)
 #   - slirp, libssh, VDE, FDT, curses
 #
 # The macOS Cocoa GL patch is vendored under patches/ and applies to the
@@ -132,7 +132,12 @@ jobs:
 
           "$Q" -device help > "$RUNNER_TEMP/devices.txt"
           grep -q 'virtio-gpu-gl-pci' "$RUNNER_TEMP/devices.txt"
-          grep -q 'qxl' "$RUNNER_TEMP/devices.txt"
+          # QXL is a VGA-class device and is not exposed by QEMU's arm64
+          # softmmu target. SPICE itself is still built and tested below;
+          # arm64 guests use virtio-gpu for the display.
+          if ! grep -q 'qxl' "$RUNNER_TEMP/devices.txt"; then
+            echo "::warning::QXL is not available on aarch64-softmmu; using virtio-gpu for SPICE"
+          fi
 
           "$Q" -display help > "$RUNNER_TEMP/displays.txt"
           grep -q 'cocoa' "$RUNNER_TEMP/displays.txt"
