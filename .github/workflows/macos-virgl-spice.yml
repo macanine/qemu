@@ -109,7 +109,9 @@ jobs:
             --disable-plugins \
             --disable-pvg \
             --enable-trace-backends=log \
-            --enable-malloc=system
+            --enable-malloc=system \
+            --extra-cflags="-I$BREW/include -I$ANGLE/include -I$EPOXY/include -I$VIRGL/include -I$DTC/include -DNCURSES_WIDECHAR=1" \
+            --extra-ldflags="-L$BREW/lib -L$ANGLE/lib -L$EPOXY/lib -L$VIRGL/lib -L$DTC/lib -Wl,-rpath,$ANGLE/lib -Wl,-rpath,$EPOXY/lib -Wl,-rpath,$VIRGL/lib"
 
       - name: Build QEMU
         run: |
