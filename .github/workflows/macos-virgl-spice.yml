@@ -75,6 +75,8 @@ jobs:
           git apply patches/macos-virgl-cocoa-gl.patch
           git apply --check patches/macos-stealth-qemu-ids.patch
           git apply patches/macos-stealth-qemu-ids.patch
+          git apply --check patches/macos-qxl-aarch64.patch
+          git apply patches/macos-qxl-aarch64.patch
           git diff --stat
 
       - name: Configure QEMU
@@ -134,12 +136,7 @@ jobs:
 
           "$Q" -device help > "$RUNNER_TEMP/devices.txt"
           grep -q 'virtio-gpu-gl-pci' "$RUNNER_TEMP/devices.txt"
-          # QXL is a VGA-class device and is not exposed by QEMU's arm64
-          # softmmu target. SPICE itself is still built and tested below;
-          # arm64 guests use virtio-gpu for the display.
-          if ! grep -q 'qxl' "$RUNNER_TEMP/devices.txt"; then
-            echo "::warning::QXL is not available on aarch64-softmmu; using virtio-gpu for SPICE"
-          fi
+          grep -q 'qxl-vga' "$RUNNER_TEMP/devices.txt"
 
           "$Q" -display help > "$RUNNER_TEMP/displays.txt"
           grep -q 'cocoa' "$RUNNER_TEMP/displays.txt"
@@ -200,14 +197,12 @@ jobs:
           grep -q 'port' "$DIST_DIR/spice-help.txt"
           "$Q" -L "$DIST_DIR/qemu/share/qemu" -device help > "$DIST_DIR/device-help.txt"
           grep -q 'virtio-gpu-gl-pci' "$DIST_DIR/device-help.txt"
-          if ! grep -q 'qxl' "$DIST_DIR/device-help.txt"; then
-            echo "::warning::QXL is not exposed by aarch64-softmmu; SPICE uses virtio-gpu"
-          fi
+          grep -q 'qxl-vga' "$DIST_DIR/device-help.txt"
 
           {
             echo "qemu_ref=$(git rev-parse HEAD)"
             echo "patch=patches/macos-virgl-cocoa-gl.patch"
-            echo "features=cocoa,hvf,spice,virglrenderer,venus,opengl,slirp,libssh,vde,fdt"
+            echo "features=cocoa,hvf,spice,qxl,virglrenderer,venus,opengl,slirp,libssh,vde,fdt"
             echo "runner=$ImageOS"
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             "$Q" -L "$DIST_DIR/qemu/share/qemu" --version
