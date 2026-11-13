@@ -1,0 +1,47 @@
+diff --git a/hw/acpi/aml-build.c b/hw/acpi/aml-build.c
+index 990abc6..82eec18 100644
+--- a/hw/acpi/aml-build.c
++++ b/hw/acpi/aml-build.c
+@@ -2585,7 +2585,7 @@ void build_fadt(GArray *tbl, BIOSLinker *linker, const AcpiFadtData *f,
+     }
+ 
+     /* Hypervisor Vendor Identity */
+-    build_append_padded_str(tbl, "QEMU", 8, '\0');
++    build_append_padded_str(tbl, "Ampere", 8, '\0');
+ 
+     /* TODO: extra fields need to be added to support revisions above rev6 */
+     assert(f->rev == 6);
+diff --git a/hw/arm/virt-acpi-build.c b/hw/arm/virt-acpi-build.c
+index d368913..a9e0e28 100644
+--- a/hw/arm/virt-acpi-build.c
++++ b/hw/arm/virt-acpi-build.c
+@@ -1228,7 +1228,11 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
+     if (vmc->acpi_expose_flash) {
+         acpi_dsdt_add_flash(scope, &memmap[VIRT_FLASH]);
+     }
+-    fw_cfg_acpi_dsdt_add(scope, &memmap[VIRT_FW_CFG]);
++    /*
++     * Do not expose the QEMU0002 fw_cfg ACPI device to the guest.  Firmware
++     * still uses fw_cfg for boot, but the runtime guest has no driver and the
++     * ACPI namespace identifier is a strong QEMU fingerprint.
++     */
+     virtio_acpi_dsdt_add(scope, memmap[VIRT_MMIO].base, memmap[VIRT_MMIO].size,
+                          (irqmap[VIRT_MMIO] + ARM_SPI_BASE),
+                          0, vms->virtio_transports);
+diff --git a/hw/pci-host/gpex.c b/hw/pci-host/gpex.c
+index e66784c..940c754 100644
+--- a/hw/pci-host/gpex.c
++++ b/hw/pci-host/gpex.c
+@@ -243,8 +243,10 @@ static void gpex_root_class_init(ObjectClass *klass, const void *data)
+ 
+     dc->desc = "QEMU generic PCIe host bridge";
+     dc->vmsd = &vmstate_gpex_root;
+-    k->vendor_id = PCI_VENDOR_ID_REDHAT;
+-    k->device_id = PCI_DEVICE_ID_REDHAT_PCIE_HOST;
++    /* Present the root complex as the Ampere Altra host bridge instead of
++     * QEMU's 1b36:0008 signature.  The class remains a PCI host bridge. */
++    k->vendor_id = 0x1def;
++    k->device_id = 0xe100;
+     k->revision = 0;
+     k->class_id = PCI_CLASS_BRIDGE_HOST;
+     /*

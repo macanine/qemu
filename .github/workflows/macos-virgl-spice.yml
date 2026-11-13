@@ -68,11 +68,13 @@ jobs:
             milesbuckton/qemu-virgl/libepoxy-angle \
             milesbuckton/qemu-virgl/virglrenderer
 
-      - name: Apply macOS Cocoa GL patch
+      - name: Apply macOS display and ACPI identity patches
         run: |
           set -euxo pipefail
           git apply --check patches/macos-virgl-cocoa-gl.patch
           git apply patches/macos-virgl-cocoa-gl.patch
+          git apply --check patches/macos-stealth-qemu-ids.patch
+          git apply patches/macos-stealth-qemu-ids.patch
           git diff --stat
 
       - name: Configure QEMU
