@@ -85,9 +85,10 @@ jobs:
           SPICE="$(brew --prefix spice-server)"
           SPICE_PROTO="$(brew --prefix spice-protocol)"
 
-          export PKG_CONFIG_PATH="$ANGLE/lib/pkgconfig:$EPOXY/lib/pkgconfig:$VIRGL/lib/pkgconfig:$SPICE/lib/pkgconfig:$SPICE/share/pkgconfig:$SPICE_PROTO/share/pkgconfig:${PKG_CONFIG_PATH:-}"
-          export CFLAGS="-I$ANGLE/include -I$EPOXY/include -I$VIRGL/include -I$DTC/include -DNCURSES_WIDECHAR=1"
-          export LDFLAGS="-L$ANGLE/lib -L$EPOXY/lib -L$VIRGL/lib -L$DTC/lib -Wl,-rpath,$ANGLE/lib -Wl,-rpath,$EPOXY/lib -Wl,-rpath,$VIRGL/lib"
+          BREW="$(brew --prefix)"
+          export PKG_CONFIG_PATH="$ANGLE/lib/pkgconfig:$EPOXY/lib/pkgconfig:$VIRGL/lib/pkgconfig:$SPICE/lib/pkgconfig:$SPICE/share/pkgconfig:$SPICE_PROTO/share/pkgconfig:$BREW/lib/pkgconfig:$BREW/share/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export CFLAGS="-I$BREW/include -I$ANGLE/include -I$EPOXY/include -I$VIRGL/include -I$DTC/include -DNCURSES_WIDECHAR=1"
+          export LDFLAGS="-L$BREW/lib -L$ANGLE/lib -L$EPOXY/lib -L$VIRGL/lib -L$DTC/lib -Wl,-rpath,$ANGLE/lib -Wl,-rpath,$EPOXY/lib -Wl,-rpath,$VIRGL/lib"
 
           ./configure \
             --prefix="$QEMU_PREFIX" \
