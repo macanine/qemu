@@ -1,0 +1,711 @@
+From c95b8c499ba420d677812a7500c037e058a7ec8a Mon Sep 17 00:00:00 2001
+From: Miles Buckton <miles.buckton@gmail.com>
+Date: Thu, 12 Nov 2026 18:35:48 +0200
+Subject: [PATCH] ui/cocoa, virtio-gpu: add GL scanout and blob support on
+ Apple Silicon
+
+Add OpenGL scanout support to the macOS Cocoa display backend using
+ANGLE's EGL implementation. This enables virgl/Venus GPU acceleration
+in QEMU VMs on Apple Silicon.
+
+Key changes:
+- Lazy EGL initialization in cocoa_gl_lazy_init(), called from the
+  first GL context create/make-current so it runs on the virglrenderer
+  thread (ANGLE requires EGL use on one thread).  Failure is sticky so
+  a half-initialized display is never used.
+- virtio_gpu_virgl_init: remember the flags and callbacks version used
+  for the first successful virgl_renderer_init() and reuse them on
+  re-init after reset.  The EGL display may only appear after the first
+  init, and virglrenderer rejects a re-init with different flags
+  (-EBUSY).
+- GL flush blits the guest texture and reads it back into the console
+  surface on the QEMU thread; the view keeps drawing from that
+  surface's pixman image.
+- hvf: skip (rather than unmap) memory sections that are not host-page
+  aligned; they were never mapped and hv_vm_unmap() would abort the VM.
+- virtio-gpu-virgl: under HVF reject blob maps whose host pointer, offset
+  or size is not host-page (16 KiB) aligned, and disable blob MAP_FIXED on
+  macOS, which has no exportable fd to mmap.
+- virtio-gpu: on hosts with pages larger than 4 KiB, offer
+  VIRTIO_GPU_F_BLOB_ALIGNMENT and report the host page size in the
+  blob_alignment config field, so the guest aligns blob sizes and
+  offsets to it (exposed to userspace as VIRTGPU_PARAM_BLOB_ALIGNMENT).
+- Declare qemu_egl_init_dpy_cocoa() in include/ui/egl-helpers.h.
+
+Fix GL scanout black screen: egl_fb_setup_new_tex() passed GL_BGRA as
+the pixel format to glTexImage2D() for the blit framebuffer texture.
+GL_BGRA is not a valid format for a GL_RGBA internal format in OpenGL
+ES / ANGLE, so the texture could not attach to an FBO and every
+glBlitFramebuffer failed, leaving the window black.  Use GL_RGBA on
+GLES and keep GL_BGRA on desktop GL.
+
+Also add fflush() to the COCOA_DEBUG macro.
+
+Assisted-by: LLM
+---
+ accel/hvf/hvf-all.c            |  12 +-
+ hw/display/virtio-gpu-base.c   |  19 ++
+ hw/display/virtio-gpu-virgl.c  |  53 +++++-
+ include/hw/virtio/virtio-gpu.h |   3 +
+ include/ui/egl-helpers.h       |   3 +
+ ui/cocoa.m                     | 317 ++++++++++++++++++++++++++++++++-
+ ui/egl-helpers.c               |  63 ++++++-
+ 7 files changed, 460 insertions(+), 10 deletions(-)
+
+diff --git a/accel/hvf/hvf-all.c b/accel/hvf/hvf-all.c
+index f233d86c06..70ec6e3e32 100644
+--- a/accel/hvf/hvf-all.c
++++ b/accel/hvf/hvf-all.c
+@@ -114,8 +114,16 @@ static void hvf_set_phys_mem(MemoryRegionSection *section, bool add)
+ 
+     if (!QEMU_IS_ALIGNED(size, page_size) ||
+         !QEMU_IS_ALIGNED(gpa, page_size)) {
+-        /* Not page aligned, so we can not map as RAM */
+-        add = false;
++        /*
++         * Not host-page aligned, so we can not map it.  The section was
++         * never mapped via hv_vm_map() (only aligned sections ever get
++         * mapped), so do NOT fall through to hv_vm_unmap(): hv_vm_unmap()
++         * of a never-mapped range fails with HV_BAD_ARGUMENT and the
++         * assert would abort the whole VM.  Accesses keep trapping.
++         */
++        warn_report_once("hvf: skipping unaligned memory section gpa 0x%"
++                         PRIx64 " size 0x%" PRIx64, gpa, size);
++        return;
+     }
+ 
+     if (!add) {
+diff --git a/hw/display/virtio-gpu-base.c b/hw/display/virtio-gpu-base.c
+index 270fbaae10..3f529facf0 100644
+--- a/hw/display/virtio-gpu-base.c
++++ b/hw/display/virtio-gpu-base.c
+@@ -178,6 +178,18 @@ static const GraphicHwOps virtio_gpu_ops = {
+     .gl_block = virtio_gpu_gl_block,
+ };
+ 
++/*
++ * Hosts with pages larger than 4 KiB (e.g. 16 KiB on Apple Silicon) can
++ * only map blobs into the hostmem region at host-page granularity, so ask
++ * the guest to align blob sizes and offsets to the host page size.
++ */
++static bool virtio_gpu_base_needs_blob_alignment(VirtIOGPUBase *g)
++{
++    return virtio_gpu_blob_enabled(g->conf) &&
++           virtio_gpu_hostmem_enabled(g->conf) &&
++           qemu_real_host_page_size() > 4096;
++}
++
+ bool
+ virtio_gpu_base_device_realize(DeviceState *qdev,
+                                VirtIOHandleOutput ctrl_cb,
+@@ -233,6 +245,10 @@ virtio_gpu_base_device_realize(DeviceState *qdev,
+     }
+ 
+     g->virtio_config.num_scanouts = cpu_to_le32(g->conf.max_outputs);
++    if (virtio_gpu_base_needs_blob_alignment(g)) {
++        g->virtio_config.blob_alignment =
++            cpu_to_le32(qemu_real_host_page_size());
++    }
+     virtio_init(VIRTIO_DEVICE(g), VIRTIO_ID_GPU,
+                 sizeof(struct virtio_gpu_config));
+ 
+@@ -276,6 +292,9 @@ virtio_gpu_base_get_features(VirtIODevice *vdev, uint64_t features,
+     if (virtio_gpu_resource_uuid_enabled(g->conf)) {
+         features |= (1 << VIRTIO_GPU_F_RESOURCE_UUID);
+     }
++    if (virtio_gpu_base_needs_blob_alignment(g)) {
++        features |= (1 << VIRTIO_GPU_F_BLOB_ALIGNMENT);
++    }
+ 
+     return features;
+ }
+diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
+index f71f287d94..8ed900a8cf 100644
+--- a/hw/display/virtio-gpu-virgl.c
++++ b/hw/display/virtio-gpu-virgl.c
+@@ -19,6 +19,7 @@
+ #include "hw/virtio/virtio-gpu.h"
+ #include "hw/virtio/virtio-gpu-bswap.h"
+ #include "hw/virtio/virtio-gpu-pixman.h"
++#include "system/hvf.h"
+ 
+ #include "ui/egl-helpers.h"
+ 
+@@ -41,8 +42,15 @@
+      VIRGL_VERSION_MICRO >= (micro))
+ #endif
+ 
++/*
++ * Blob MAP_FIXED maps the resource's exported fd straight into the hostmem
++ * window.  It is unavailable on Windows and on macOS (no dma-buf/opaque-fd
++ * export to mmap), independent of the accelerator in use; there the
++ * glMapBufferRange()-based virgl_renderer_resource_map() path is used.
++ */
+ #define VIRGL_HAS_MAP_FIXED \
+-    (VIRGL_CHECK_VERSION(1, 3, 0) && !IS_ENABLED(CONFIG_WIN32))
++    (VIRGL_CHECK_VERSION(1, 3, 0) && !IS_ENABLED(CONFIG_WIN32) && \
++     !IS_ENABLED(CONFIG_DARWIN))
+ 
+ struct virtio_gpu_virgl_resource {
+     struct virtio_gpu_simple_resource base;
+@@ -214,6 +222,29 @@ virtio_gpu_virgl_map_resource_blob(VirtIOGPU *g,
+         return ret;
+     }
+ 
++    /*
++     * Under HVF the mapped blob is added as guest RAM and backed with
++     * hv_vm_map(), which requires host-page alignment (16 KiB on Apple
++     * Silicon) of the host pointer, the guest physical offset and the
++     * size.  Blob offsets and sizes are guest-page (4 KiB) granular and
++     * glMapBufferRange() host pointers are arbitrary, so an unaligned
++     * blob cannot be backed here: reject the map and unpin the virgl
++     * mapping.  The guest gets VIRTIO_GPU_RESP_ERR_UNSPEC and falls back
++     * to transfer-based access to the resource instead of crashing the
++     * accelerator's memory listener.
++     */
++    if (hvf_enabled() &&
++        (((uintptr_t)data | size | offset) &
++         (qemu_real_host_page_size() - 1))) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: blob %" PRIu32 " is not host-page aligned "
++                      "(ptr=%p size=%" PRIu64 " offset=%" PRIu64 "), "
++                      "rejecting map\n",
++                      __func__, res->base.resource_id, data, size, offset);
++        virgl_renderer_resource_unmap(res->base.resource_id);
++        return -EOPNOTSUPP;
++    }
++
+     vmr = g_new0(struct virtio_gpu_virgl_hostmem_region, 1);
+     name = g_strdup_printf("blob[%" PRIu32 "]", res->base.resource_id);
+     object_initialize_child(OBJECT(g), name, vmr,
+@@ -1516,11 +1547,31 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
+     }
+ #endif
+ 
++    if (gl->virgl_initialized) {
++        /*
++         * virglrenderer state survives virgl_renderer_reset() and
++         * virgl_renderer_init() refuses different flags with -EBUSY.  The
++         * EGL display may have appeared since the first init (cocoa
++         * initializes EGL lazily from the first GL context request), so
++         * re-init with exactly the parameters that were used originally.
++         * The flags computed above from the current state are deliberately
++         * discarded.  Restoring the version in the shared callbacks struct
++         * is safe: virglrenderer is a process-wide singleton, so there is
++         * only ever one initialized renderer, and fields beyond the
++         * restored version are ignored by virglrenderer.
++         */
++        flags = gl->virgl_flags;
++        virtio_gpu_3d_cbs.version = gl->virgl_cbs_version;
++    }
++
+     ret = virgl_renderer_init(g, flags, &virtio_gpu_3d_cbs);
+     if (ret != 0) {
+         error_report("virgl could not be initialized: %d", ret);
+         return ret;
+     }
++    gl->virgl_initialized = true;
++    gl->virgl_flags = flags;
++    gl->virgl_cbs_version = virtio_gpu_3d_cbs.version;
+ 
+     gl->fence_poll = timer_new_ms(QEMU_CLOCK_VIRTUAL,
+                                   virtio_gpu_fence_poll, g);
+diff --git a/include/hw/virtio/virtio-gpu.h b/include/hw/virtio/virtio-gpu.h
+index 631dfc63a4..ec1ffb228d 100644
+--- a/include/hw/virtio/virtio-gpu.h
++++ b/include/hw/virtio/virtio-gpu.h
+@@ -255,6 +255,9 @@ struct VirtIOGPUGL {
+     struct VirtIOGPU parent_obj;
+ 
+     RenderState renderer_state;
++    bool virgl_initialized;
++    uint32_t virgl_flags;
++    int virgl_cbs_version;
+ 
+     QEMUTimer *fence_poll;
+     QEMUTimer *print_stats;
+diff --git a/include/ui/egl-helpers.h b/include/ui/egl-helpers.h
+index 533d9afc37..284a752f09 100644
+--- a/include/ui/egl-helpers.h
++++ b/include/ui/egl-helpers.h
+@@ -76,6 +76,9 @@ int qemu_egl_init_dpy_mesa(EGLNativeDisplayType dpy, DisplayGLMode mode);
+ #ifdef WIN32
+ int qemu_egl_init_dpy_win32(EGLNativeDisplayType dpy, DisplayGLMode mode);
+ #endif
++#ifdef CONFIG_COCOA
++int qemu_egl_init_dpy_cocoa(EGLNativeDisplayType dpy, DisplayGLMode mode);
++#endif
+ 
+ EGLContext qemu_egl_init_ctx(void);
+ bool qemu_egl_has_dmabuf(void);
+diff --git a/ui/cocoa.m b/ui/cocoa.m
+index 36a72d3623..2af67b0449 100644
+--- a/ui/cocoa.m
++++ b/ui/cocoa.m
+@@ -33,8 +33,16 @@
+ #include "standard-headers/linux/input-event-codes.h"
+ #include "ui/clipboard.h"
+ #include "ui/console.h"
++#include "ui/surface.h"
+ #include "ui/input.h"
+ #include "ui/kbd-state.h"
++#ifdef CONFIG_OPENGL
++#include "ui/egl-helpers.h"
++#include "ui/egl-context.h"
++#include "ui/shader.h"
++#include "epoxy/gl.h"
++#include "epoxy/egl.h"
++#endif
+ #include "system/system.h"
+ #include "system/runstate.h"
+ #include "system/runstate-action.h"
+@@ -59,7 +67,7 @@
+ //#define DEBUG
+ 
+ #ifdef DEBUG
+-#define COCOA_DEBUG(...)  { (void) fprintf (stdout, __VA_ARGS__); }
++#define COCOA_DEBUG(...)  { (void) fprintf (stdout, __VA_ARGS__); fflush(stdout); }
+ #else
+ #define COCOA_DEBUG(...)  ((void) 0)
+ #endif
+@@ -211,6 +219,280 @@ - (void) raiseAllKeys;
+ 
+ QemuCocoaView *cocoaView;
+ 
++/* ------------------------------------------------------------------ */
++/* GL scanout state                                                    */
++/* ------------------------------------------------------------------ */
++#ifdef CONFIG_OPENGL
++static bool cocoa_gl_enabled;
++static QemuGLShader *cocoa_gls;
++static DisplayGLCtx cocoa_gl_ctx;
++static EGLSurface cocoa_gl_surface = EGL_NO_SURFACE;
++static egl_fb cocoa_guest_fb;
++static egl_fb cocoa_blit_fb;
++static bool cocoa_y_0_top;
++static uint32_t cocoa_scanout_x, cocoa_scanout_y;
++/* Surface the GL scanout is read back into; sized to the scanout. */
++static DisplaySurface *cocoa_gl_ds;
++
++/*
++ * All EGL use happens on the thread that initialized it.  That is the
++ * QEMU main-loop thread: virgl_renderer_init() requests its first GL
++ * context there (under the BQL), and the display listener callbacks run
++ * there too.  ANGLE requires EGL to be used from a single thread.
++ */
++static pthread_t egl_init_thread;
++static bool egl_thread_set;
++static bool egl_init_failed;
++static DisplayGLMode pending_gl_mode;
++
++static bool cocoa_gl_ready(void)
++{
++    return egl_thread_set && pthread_equal(pthread_self(), egl_init_thread);
++}
++
++static bool cocoa_gl_make_current_rn(void)
++{
++    if (!cocoa_gl_ready()) {
++        return false;
++    }
++    return eglMakeCurrent(qemu_egl_display, cocoa_gl_surface,
++                          cocoa_gl_surface, qemu_egl_rn_ctx);
++}
++
++static void cocoa_gl_show_console_surface(DisplayChangeListener *dcl)
++{
++    DisplaySurface *ds = qemu_console_surface(dcl->con);
++
++    if (ds) {
++        cocoa_switch(dcl, ds);
++    }
++}
++
++static void cocoa_gl_switch(DisplayChangeListener *dcl,
++                            DisplaySurface *surface)
++{
++    /* While a GL scanout is shown, keep displaying its readback surface. */
++    if (cocoa_gl_ds) {
++        return;
++    }
++    cocoa_switch(dcl, surface);
++}
++
++static void cocoa_gl_scanout_disable(DisplayChangeListener *dcl)
++{
++    COCOA_DEBUG("qemu_cocoa: cocoa_gl_scanout_disable\n");
++    if (cocoa_gl_make_current_rn()) {
++        egl_fb_destroy(&cocoa_guest_fb);
++        egl_fb_destroy(&cocoa_blit_fb);
++    }
++    g_clear_pointer(&cocoa_gl_ds, qemu_free_displaysurface);
++    cocoa_gl_show_console_surface(dcl);
++}
++
++static void cocoa_gl_scanout_texture(DisplayChangeListener *dcl,
++                                     uint32_t backing_id,
++                                     bool backing_y_0_top,
++                                     uint32_t backing_width,
++                                     uint32_t backing_height,
++                                     uint32_t x, uint32_t y,
++                                     uint32_t w, uint32_t h,
++                                     void *d3d_tex2d)
++{
++    COCOA_DEBUG("qemu_cocoa: cocoa_gl_scanout_texture %ux%u+%u+%u of %ux%u\n",
++                w, h, x, y, backing_width, backing_height);
++
++    if (!cocoa_gl_make_current_rn()) {
++        return;
++    }
++
++    cocoa_y_0_top = backing_y_0_top;
++    cocoa_scanout_x = x;
++    cocoa_scanout_y = y;
++
++    egl_fb_setup_for_tex(&cocoa_guest_fb,
++                         backing_width, backing_height, backing_id, false);
++
++    if (cocoa_blit_fb.width != w || cocoa_blit_fb.height != h) {
++        egl_fb_destroy(&cocoa_blit_fb);
++        egl_fb_setup_new_tex(&cocoa_blit_fb, w, h);
++    }
++
++    if (!cocoa_gl_ds ||
++        surface_width(cocoa_gl_ds) != w ||
++        surface_height(cocoa_gl_ds) != h) {
++        g_clear_pointer(&cocoa_gl_ds, qemu_free_displaysurface);
++        cocoa_gl_ds = qemu_create_displaysurface(w, h);
++        /* The view takes its own reference to the pixman image. */
++        cocoa_switch(dcl, cocoa_gl_ds);
++    }
++}
++
++static void cocoa_gl_flush(DisplayChangeListener *dcl,
++                           uint32_t x, uint32_t y,
++                           uint32_t w, uint32_t h)
++{
++    GLint sx0, sy0, sx1, sy1;
++
++    COCOA_DEBUG("qemu_cocoa: cocoa_gl_flush\n");
++
++    if (!cocoa_guest_fb.texture || !cocoa_gl_ds || !cocoaView ||
++        !cocoa_gl_make_current_rn()) {
++        return;
++    }
++
++    /* Blit the scanout sub-rectangle, flipping like egl_fb_blit(). */
++    sx0 = cocoa_scanout_x;
++    sx1 = cocoa_scanout_x + cocoa_blit_fb.width;
++    sy0 = cocoa_scanout_y;
++    sy1 = cocoa_scanout_y + cocoa_blit_fb.height;
++    glBindFramebuffer(GL_READ_FRAMEBUFFER, cocoa_guest_fb.framebuffer);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, cocoa_blit_fb.framebuffer);
++    glViewport(0, 0, cocoa_blit_fb.width, cocoa_blit_fb.height);
++    glBlitFramebuffer(sx0, cocoa_y_0_top ? sy1 : sy0,
++                      sx1, cocoa_y_0_top ? sy0 : sy1,
++                      0, 0, cocoa_blit_fb.width, cocoa_blit_fb.height,
++                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
++
++    /*
++     * Read the whole frame back into the GL surface, whose pixman image
++     * the view draws from.  This is a synchronous full-frame readback on
++     * every flush, ignoring the dirty rectangle: simple, but the main
++     * performance cost of this path.
++     */
++    egl_fb_read(cocoa_gl_ds, &cocoa_blit_fb);
++
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [cocoaView setNeedsDisplay:YES];
++    });
++}
++
++static const DisplayChangeListenerOps dcl_gl_ops = {
++    .dpy_name                = "cocoa-gl",
++    .dpy_gfx_update          = cocoa_update,
++    .dpy_gfx_switch          = cocoa_gl_switch,
++    .dpy_refresh             = cocoa_refresh,
++    .dpy_mouse_set           = cocoa_mouse_set,
++    .dpy_cursor_define       = cocoa_cursor_define,
++    .dpy_gl_scanout_disable  = cocoa_gl_scanout_disable,
++    .dpy_gl_scanout_texture  = cocoa_gl_scanout_texture,
++    .dpy_gl_update           = cocoa_gl_flush,
++};
++
++static bool
++cocoa_gl_is_compatible_dcl(DisplayGLCtx *dgc,
++                            DisplayChangeListener *dcl)
++{
++    return dcl->ops == &dcl_gl_ops;
++}
++
++/*
++ * EGL is initialized on the first GL context request, from the thread
++ * that will use it.  Failure is sticky so later calls do not continue
++ * with a half-initialized display.
++ */
++static bool cocoa_gl_lazy_init(void)
++{
++    Error *err = NULL;
++    const EGLint pb_attrs[] = {
++        EGL_WIDTH, 1,
++        EGL_HEIGHT, 1,
++        EGL_NONE,
++    };
++
++    if (egl_thread_set) {
++        return true;
++    }
++    if (egl_init_failed) {
++        return false;
++    }
++
++    if (!egl_init(NULL, pending_gl_mode, &err)) {
++        error_report_err(err);
++        egl_init_failed = true;
++        return false;
++    }
++
++    cocoa_gl_surface = eglCreatePbufferSurface(qemu_egl_display,
++                                               qemu_egl_config, pb_attrs);
++    if (cocoa_gl_surface == EGL_NO_SURFACE) {
++        error_report("cocoa: eglCreatePbufferSurface failed: %s",
++                     qemu_egl_get_error_string());
++        egl_init_failed = true;
++        return false;
++    }
++
++    if (!eglMakeCurrent(qemu_egl_display, cocoa_gl_surface,
++                        cocoa_gl_surface, qemu_egl_rn_ctx)) {
++        error_report("cocoa: eglMakeCurrent failed: %s",
++                     qemu_egl_get_error_string());
++        egl_init_failed = true;
++        return false;
++    }
++
++    cocoa_gls = qemu_gl_init_shader();
++    if (!cocoa_gls) {
++        error_report("cocoa: GL shader init failed");
++        egl_init_failed = true;
++        return false;
++    }
++
++    egl_init_thread = pthread_self();
++    egl_thread_set = true;
++    return true;
++}
++
++static QEMUGLContext cocoa_gl_create_context(DisplayGLCtx *dgc,
++                                               QEMUGLParams *params)
++{
++    if (!cocoa_gl_lazy_init()) {
++        return NULL;
++    }
++    return qemu_egl_create_context(dgc, params, qemu_egl_rn_ctx);
++}
++
++static int cocoa_gl_ctx_make_current(DisplayGLCtx *dgc, QEMUGLContext ctx)
++{
++    pthread_t cur = pthread_self();
++
++    if (!cocoa_gl_lazy_init()) {
++        return -1;
++    }
++
++    if (!pthread_equal(cur, egl_init_thread)) {
++        error_report("cocoa: eglMakeCurrent on wrong thread");
++        return -1;
++    }
++
++    EGLBoolean b = eglMakeCurrent(qemu_egl_display, cocoa_gl_surface,
++                                  cocoa_gl_surface, ctx);
++    if (!b) {
++        error_report("cocoa: eglMakeCurrent failed: %s",
++                     qemu_egl_get_error_string());
++        return -1;
++    }
++    return 0;
++}
++
++static const DisplayGLCtxOps cocoa_gl_ctx_ops = {
++    .dpy_gl_ctx_is_compatible_dcl = cocoa_gl_is_compatible_dcl,
++    .dpy_gl_ctx_create       = cocoa_gl_create_context,
++    .dpy_gl_ctx_destroy      = qemu_egl_destroy_context,
++    .dpy_gl_ctx_make_current = cocoa_gl_ctx_make_current,
++};
++
++static void cocoa_early_init(DisplayOptions *opts)
++{
++    if (opts->has_gl && opts->gl != DISPLAY_GL_MODE_OFF) {
++        pending_gl_mode = opts->gl;
++        cocoa_gl_enabled = true;
++        display_opengl = 1;
++    }
++}
++
++#else /* !CONFIG_OPENGL */
++static void cocoa_early_init(DisplayOptions *opts) { }
++#endif
++
+ static CGEventRef handleTapEvent(CGEventTapProxy proxy, CGEventType type, CGEventRef cgEvent, void *userInfo)
+ {
+     QemuCocoaView *view = userInfo;
+@@ -2019,8 +2301,18 @@ static void cocoa_display_init(DisplayState *ds, DisplayOptions *opts)
+     add_console_menu_entries();
+     addRemovableDevicesMenuItems();
+ 
++#ifdef CONFIG_OPENGL
++    if (cocoa_gl_enabled) {
++        cocoa_gl_ctx.ops = &cocoa_gl_ctx_ops;
++        qemu_console_set_display_gl_ctx(qemu_console_lookup_default(),
++                                        &cocoa_gl_ctx);
++        COCOA_DEBUG("qemu_cocoa: GL scanout enabled via ANGLE EGL (deferred init)\n");
++    }
++#endif
++
++    const DisplayChangeListenerOps *ops = cocoa_gl_enabled ? &dcl_gl_ops : &dcl_ops;
+     qemu_console_register_listener(qemu_console_lookup_default(),
+-                                   &dcl, &dcl_ops);
++                                   &dcl, ops);
+     kbd = qkbd_state_init(dcl.con);
+     qemu_add_mouse_mode_change_notifier(&mouse_mode_change_notifier);
+     [cocoaView notifyMouseModeChange];
+@@ -2047,6 +2339,26 @@ static void cocoa_display_cleanup(void)
+ 
+     qemu_console_unregister_listener(&dcl);
+     g_clear_pointer(&kbd, qkbd_state_free);
++#ifdef CONFIG_OPENGL
++    /*
++     * GL objects may only be released on the EGL thread; if cleanup runs
++     * elsewhere, leave them to process exit rather than break ANGLE's
++     * single-thread rule.
++     */
++    if (cocoa_gl_enabled && cocoa_gl_make_current_rn()) {
++        egl_fb_destroy(&cocoa_guest_fb);
++        egl_fb_destroy(&cocoa_blit_fb);
++        qemu_gl_fini_shader(cocoa_gls);
++        cocoa_gls = NULL;
++        eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
++                       EGL_NO_CONTEXT);
++        eglDestroySurface(qemu_egl_display, cocoa_gl_surface);
++        cocoa_gl_surface = EGL_NO_SURFACE;
++        egl_thread_set = false;
++        egl_init_failed = true;
++    }
++    g_clear_pointer(&cocoa_gl_ds, qemu_free_displaysurface);
++#endif
+     qemu_remove_mouse_mode_change_notifier(&mouse_mode_change_notifier);
+     qemu_clipboard_peer_unregister(&cbpeer);
+     g_clear_pointer(&cbinfo, qemu_clipboard_info_unref);
+@@ -2057,6 +2369,7 @@ static void cocoa_display_cleanup(void)
+ 
+ static QemuDisplay qemu_display_cocoa = {
+     .type       = DISPLAY_TYPE_COCOA,
++    .early_init = cocoa_early_init,
+     .init       = cocoa_display_init,
+     .cleanup    = cocoa_display_cleanup,
+ };
+diff --git a/ui/egl-helpers.c b/ui/egl-helpers.c
+index cb9c1e839c..aa10ecb297 100644
+--- a/ui/egl-helpers.c
++++ b/ui/egl-helpers.c
+@@ -132,8 +132,15 @@ void egl_fb_setup_new_tex(egl_fb *fb, int width, int height)
+ 
+     glGenTextures(1, &texture);
+     glBindTexture(GL_TEXTURE_2D, texture);
+-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height,
+-                 0, GL_BGRA, GL_UNSIGNED_BYTE, 0);
++    /*
++     * GLES requires format to match internalformat.  The texture's byte
++     * order then differs between desktop GL and GLES, but egl_fb_read()
++     * still reads back as GL_BGRA, which GLES (ANGLE) supports through
++     * EXT_read_format_bgra.
++     */
++    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
++                 epoxy_is_desktop_gl() ? GL_BGRA : GL_RGBA,
++                 GL_UNSIGNED_BYTE, 0);
+ 
+     egl_fb_setup_for_tex(fb, width, height, texture, true);
+ }
+@@ -491,7 +498,7 @@ EGLSurface qemu_egl_init_surface_x11(EGLContext ectx, EGLNativeWindowType win)
+ 
+ /* ---------------------------------------------------------------------- */
+ 
+-#if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32)
++#if defined(CONFIG_X11) || defined(CONFIG_GBM) || defined(WIN32) || defined(CONFIG_COCOA)
+ 
+ /*
+  * Taken from glamor_egl.h from the Xorg xserver, which is MIT licensed
+@@ -529,7 +536,11 @@ EGLDisplay qemu_egl_get_display(EGLNativeDisplayType native,
+     /* In practise any EGL 1.5 implementation would support the EXT extension */
+     if (epoxy_has_egl_extension(NULL, "EGL_EXT_platform_base")) {
+         if (platform != 0) {
+-            dpy = eglGetPlatformDisplayEXT(platform, native, NULL);
++            /*
++             * EGLNativeDisplayType is a pointer on most platforms but an
++             * integer in ANGLE's macOS headers; go via uintptr_t for both.
++             */
++            dpy = eglGetPlatformDisplayEXT(platform, (void *)(uintptr_t)native, NULL);
+         }
+     }
+ 
+@@ -621,6 +632,30 @@ int qemu_egl_init_dpy_mesa(EGLNativeDisplayType dpy, DisplayGLMode mode)
+ }
+ #endif
+ 
++#ifdef CONFIG_COCOA
++int qemu_egl_init_dpy_cocoa(EGLNativeDisplayType dpy, DisplayGLMode mode)
++{
++    /*
++     * ANGLE provides EGL on macOS via Metal.  It only supports GL ES, so
++     * map the generic "on" request to ES and reject an explicit core
++     * profile request.
++     */
++    if (mode == DISPLAY_GL_MODE_CORE) {
++        error_report("egl: ANGLE on macOS supports only gl=es");
++        return -1;
++    }
++    if (mode == DISPLAY_GL_MODE_ON) {
++        mode = DISPLAY_GL_MODE_ES;
++    }
++
++    if (qemu_egl_init_dpy(dpy, 0, mode) < 0) {
++        return -1;
++    }
++
++    return 0;
++}
++#endif
++
+ 
+ #ifdef WIN32
+ int qemu_egl_init_dpy_win32(EGLNativeDisplayType dpy, DisplayGLMode mode)
+@@ -709,7 +744,25 @@ bool egl_init(const char *rendernode, DisplayGLMode mode, Error **errp)
+         return false;
+     }
+ 
+-#ifdef WIN32
++#if defined(CONFIG_COCOA)
++    /*
++     * ANGLE on macOS: use the default display, force GL ES.  This applies
++     * to every EGL user in a macOS build (cocoa, egl-headless, dbus, ...);
++     * there are no DRM render nodes on macOS.
++     */
++    if (rendernode) {
++        warn_report("egl: rendernode is not supported on macOS, ignoring");
++    }
++    if (qemu_egl_init_dpy_cocoa(EGL_DEFAULT_DISPLAY, mode) < 0) {
++        error_setg(errp, "egl: cocoa/ANGLE init failed");
++        return false;
++    }
++    qemu_egl_rn_ctx = qemu_egl_init_ctx();
++    if (!qemu_egl_rn_ctx) {
++        error_setg(errp, "egl: egl_init_ctx failed");
++        return false;
++    }
++#elif defined(WIN32)
+     if (qemu_egl_init_dpy_win32(EGL_DEFAULT_DISPLAY, mode) < 0) {
+         error_setg(errp, "egl: init failed");
+         return false;
+-- 
+GitLab
+

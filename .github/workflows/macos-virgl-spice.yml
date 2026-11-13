@@ -1,0 +1,231 @@
+name: macOS arm64 QEMU (VirGL + Venus + SPICE)
+
+# Cloud-only build. The runner is GitHub's macOS 27 / Xcode 27 arm64 image.
+# The resulting tarball is a self-contained QEMU with:
+#   - Cocoa display + HVF
+#   - virtio-gpu-gl-pci / virglrenderer / ANGLE (GL/GLES over Metal)
+#   - Venus Vulkan (provided by the virglrenderer bottle)
+#   - SPICE server + QXL
+#   - slirp, libssh, VDE, FDT, curses
+#
+# The macOS Cocoa GL patch is vendored under patches/ and applies to the
+# upstream commit this fork's master is pinned to.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "macos-qemu-*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-qemu-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+  HOMEBREW_NO_ANALYTICS: 1
+  QEMU_PREFIX: ${{ runner.temp }}/qemu-prefix
+  DIST_DIR: ${{ runner.temp }}/dist
+
+jobs:
+  build:
+    # GitHub's current arm64 macOS 27 image. This is the same runner family
+    # used by the macOS virgl Homebrew tap, so its arm64_golden_gate bottles
+    # (libangle, libepoxy-angle, virglrenderer, spice-server) are usable.
+    runs-on: xcode-27
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout QEMU fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Show source pin
+        run: |
+          set -euxo pipefail
+          git rev-parse HEAD
+          git log -1 --oneline
+          test -s patches/macos-virgl-cocoa-gl.patch
+
+      - name: Install Homebrew dependencies
+        run: |
+          set -euxo pipefail
+          brew tap milesbuckton/qemu-virgl
+          brew trust milesbuckton/qemu-virgl
+          brew install \
+            meson ninja pkgconf libtool dtc \
+            glib gnutls jpeg-turbo libpng libslirp libssh libusb \
+            lzo ncurses pixman snappy vde zstd dylibbundler \
+            spice-server spice-protocol
+          # macOS virgl/ANGLE/Venus dependencies. These are keg-only and are
+          # addressed explicitly below, not linked into the shared prefix.
+          brew install \
+            milesbuckton/qemu-virgl/libangle \
+            milesbuckton/qemu-virgl/libepoxy-angle \
+            milesbuckton/qemu-virgl/virglrenderer
+
+      - name: Apply macOS Cocoa GL patch
+        run: |
+          set -euxo pipefail
+          git apply --check patches/macos-virgl-cocoa-gl.patch
+          git apply patches/macos-virgl-cocoa-gl.patch
+          git diff --stat
+
+      - name: Configure QEMU
+        run: |
+          set -euxo pipefail
+          ANGLE="$(brew --prefix milesbuckton/qemu-virgl/libangle)"
+          EPOXY="$(brew --prefix milesbuckton/qemu-virgl/libepoxy-angle)"
+          VIRGL="$(brew --prefix milesbuckton/qemu-virgl/virglrenderer)"
+          DTC="$(brew --prefix dtc)"
+          SPICE="$(brew --prefix spice-server)"
+          SPICE_PROTO="$(brew --prefix spice-protocol)"
+
+          export PKG_CONFIG_PATH="$ANGLE/lib/pkgconfig:$EPOXY/lib/pkgconfig:$VIRGL/lib/pkgconfig:$SPICE/lib/pkgconfig:$SPICE/share/pkgconfig:$SPICE_PROTO/share/pkgconfig:${PKG_CONFIG_PATH:-}"
+          export CFLAGS="-I$ANGLE/include -I$EPOXY/include -I$VIRGL/include -I$DTC/include -DNCURSES_WIDECHAR=1"
+          export LDFLAGS="-L$ANGLE/lib -L$EPOXY/lib -L$VIRGL/lib -L$DTC/lib -Wl,-rpath,$ANGLE/lib -Wl,-rpath,$EPOXY/lib -Wl,-rpath,$VIRGL/lib"
+
+          ./configure \
+            --prefix="$QEMU_PREFIX" \
+            --target-list=aarch64-softmmu \
+            --enable-cocoa \
+            --enable-hvf \
+            --enable-spice \
+            --enable-opengl \
+            --enable-virglrenderer \
+            --enable-slirp \
+            --enable-libssh \
+            --enable-vde \
+            --enable-fdt=system \
+            --disable-gtk \
+            --disable-sdl \
+            --disable-docs \
+            --disable-tests \
+            --disable-plugins \
+            --disable-pvg \
+            --enable-trace-backends=log \
+            --enable-malloc=system
+
+      - name: Build QEMU
+        run: |
+          set -euxo pipefail
+          make -j"$(sysctl -n hw.ncpu)"
+
+      - name: Install QEMU
+        run: |
+          set -euxo pipefail
+          make install
+          "$QEMU_PREFIX/bin/qemu-system-aarch64" --version
+          "$QEMU_PREFIX/bin/qemu-img" --version
+
+      - name: Smoke-test SPICE, QXL, VirGL and Cocoa
+        run: |
+          set -euxo pipefail
+          Q="$QEMU_PREFIX/bin/qemu-system-aarch64"
+
+          "$Q" -device help > "$RUNNER_TEMP/devices.txt"
+          grep -q 'virtio-gpu-gl-pci' "$RUNNER_TEMP/devices.txt"
+          grep -q 'qxl-vga' "$RUNNER_TEMP/devices.txt"
+
+          "$Q" -display help > "$RUNNER_TEMP/displays.txt"
+          grep -q 'cocoa' "$RUNNER_TEMP/displays.txt"
+
+          # -spice help prints the supported chardev/port options and exits.
+          "$Q" -spice help > "$RUNNER_TEMP/spice.txt" 2>&1 || true
+          grep -q 'port' "$RUNNER_TEMP/spice.txt"
+
+          # Confirm that the macOS GL path is compiled in and the dylibs are
+          # actually linked, not merely present in the build tree.
+          strings "$Q" | grep -q 'gl=es'
+          otool -L "$Q" | grep -E 'virglrenderer|epoxy|EGL|GLES'
+
+          # Start a paused VM with a SPICE server and verify the TCP port.
+          "$Q" \
+            -M virt -cpu max -m 128 \
+            -display none -nodefaults \
+            -spice port=5930,disable-ticketing=on \
+            -S -daemonize -pidfile "$RUNNER_TEMP/spice.pid"
+          for i in 1 2 3 4 5; do
+            if nc -z 127.0.0.1 5930; then break; fi
+            sleep 1
+          done
+          nc -z 127.0.0.1 5930
+          kill "$(cat "$RUNNER_TEMP/spice.pid")" || true
+
+      - name: Package a portable QEMU tarball
+        run: |
+          set -euxo pipefail
+          mkdir -p "$DIST_DIR/qemu/bin" "$DIST_DIR/qemu/lib" "$DIST_DIR/qemu/share"
+          cp "$QEMU_PREFIX/bin/qemu-system-aarch64" "$DIST_DIR/qemu/bin/"
+          cp "$QEMU_PREFIX/bin/qemu-img" "$DIST_DIR/qemu/bin/"
+          cp -R "$QEMU_PREFIX/share/qemu" "$DIST_DIR/qemu/share/"
+
+          # Copy Homebrew-linked dylibs and rewrite install names to a path
+          # relative to the executable. QEMU's own share/qemu remains co-located.
+          for exe in qemu-system-aarch64 qemu-img; do
+            dylibbundler -od -b \
+              -x "$DIST_DIR/qemu/bin/$exe" \
+              -d "$DIST_DIR/qemu/lib" \
+              -p "@executable_path/../lib"
+          done
+
+          cat > "$DIST_DIR/qemu/entitlements.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>com.apple.security.hypervisor</key>
+            <true/>
+            <key>com.apple.security.cs.allow-jit</key>
+            <true/>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+          find "$DIST_DIR/qemu/lib" -type f -name '*.dylib' -exec codesign --force --sign - {} \;
+          codesign --force --sign - \
+            --entitlements "$DIST_DIR/qemu/entitlements.plist" \
+            "$DIST_DIR/qemu/bin/qemu-system-aarch64"
+          codesign --force --sign - "$DIST_DIR/qemu/bin/qemu-img"
+
+          {
+            echo "qemu_ref=$(git rev-parse HEAD)"
+            echo "patch=patches/macos-virgl-cocoa-gl.patch"
+            echo "features=cocoa,hvf,spice,qxl,virglrenderer,venus,opengl,slirp,libssh,vde,fdt"
+            echo "runner=$ImageOS"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            "$DIST_DIR/qemu/bin/qemu-system-aarch64" --version
+            echo "--- otool ---"
+            otool -L "$DIST_DIR/qemu/bin/qemu-system-aarch64"
+            echo "--- codesign ---"
+            codesign -dv --entitlements :- "$DIST_DIR/qemu/bin/qemu-system-aarch64" 2>&1 || true
+          } > "$DIST_DIR/qemu/BUILD-INFO.txt"
+
+          tar -C "$DIST_DIR" -czf "$DIST_DIR/qemu-macos-arm64-virgl-spice.tar.gz" qemu
+          shasum -a 256 "$DIST_DIR/qemu-macos-arm64-virgl-spice.tar.gz" \
+            | tee "$DIST_DIR/qemu-macos-arm64-virgl-spice.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-macos-arm64-virgl-spice
+          path: |
+            ${{ runner.temp }}/dist/qemu-macos-arm64-virgl-spice.tar.gz
+            ${{ runner.temp }}/dist/qemu-macos-arm64-virgl-spice.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach to release on tag
+        if: startsWith(github.ref, 'refs/tags/macos-qemu-')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ runner.temp }}/dist/qemu-macos-arm64-virgl-spice.tar.gz
+            ${{ runner.temp }}/dist/qemu-macos-arm64-virgl-spice.tar.gz.sha256
+          generate_release_notes: true
