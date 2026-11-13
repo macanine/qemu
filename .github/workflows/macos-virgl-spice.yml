@@ -59,7 +59,7 @@ jobs:
           brew install \
             meson ninja pkgconf libtool dtc \
             glib gnutls jpeg-turbo libpng libslirp libssh libusb \
-            lzo ncurses pixman snappy vde zstd dylibbundler \
+            lzo ncurses pixman snappy vde zstd \
             spice-server spice-protocol
           # macOS virgl/ANGLE/Venus dependencies. These are keg-only and are
           # addressed explicitly below, not linked into the shared prefix.
@@ -172,15 +172,6 @@ jobs:
           cp "$QEMU_PREFIX/bin/qemu-img" "$DIST_DIR/qemu/bin/"
           cp -R "$QEMU_PREFIX/share/qemu" "$DIST_DIR/qemu/share/"
 
-          # Copy Homebrew-linked dylibs and rewrite install names to a path
-          # relative to the executable. QEMU's own share/qemu remains co-located.
-          for exe in qemu-system-aarch64 qemu-img; do
-            dylibbundler -od -b \
-              -x "$DIST_DIR/qemu/bin/$exe" \
-              -d "$DIST_DIR/qemu/lib" \
-              -p "@executable_path/../lib"
-          done
-
           cat > "$DIST_DIR/qemu/entitlements.plist" <<'PLIST'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -196,23 +187,31 @@ jobs:
           </plist>
           PLIST
 
-          find "$DIST_DIR/qemu/lib" -type f -name '*.dylib' -exec codesign --force --sign - {} \;
-          codesign --force --sign - \
-            --entitlements "$DIST_DIR/qemu/entitlements.plist" \
-            "$DIST_DIR/qemu/bin/qemu-system-aarch64"
-          codesign --force --sign - "$DIST_DIR/qemu/bin/qemu-img"
+          # Recursively copy Homebrew dylibs, rewrite install names, remove
+          # duplicate LC_RPATH entries, and ad-hoc sign with the HVF entitlement.
+          python3 scripts/ci/bundle_macos_qemu.py "$DIST_DIR/qemu"
+
+          Q="$DIST_DIR/qemu/bin/qemu-system-aarch64"
+          "$Q" -L "$DIST_DIR/qemu/share/qemu" --version
+          "$Q" -L "$DIST_DIR/qemu/share/qemu" -spice help > "$DIST_DIR/spice-help.txt" 2>&1
+          grep -q 'port' "$DIST_DIR/spice-help.txt"
+          "$Q" -L "$DIST_DIR/qemu/share/qemu" -device help > "$DIST_DIR/device-help.txt"
+          grep -q 'virtio-gpu-gl-pci' "$DIST_DIR/device-help.txt"
+          if ! grep -q 'qxl' "$DIST_DIR/device-help.txt"; then
+            echo "::warning::QXL is not exposed by aarch64-softmmu; SPICE uses virtio-gpu"
+          fi
 
           {
             echo "qemu_ref=$(git rev-parse HEAD)"
             echo "patch=patches/macos-virgl-cocoa-gl.patch"
-            echo "features=cocoa,hvf,spice,qxl,virglrenderer,venus,opengl,slirp,libssh,vde,fdt"
+            echo "features=cocoa,hvf,spice,virglrenderer,venus,opengl,slirp,libssh,vde,fdt"
             echo "runner=$ImageOS"
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            "$DIST_DIR/qemu/bin/qemu-system-aarch64" --version
+            "$Q" -L "$DIST_DIR/qemu/share/qemu" --version
             echo "--- otool ---"
-            otool -L "$DIST_DIR/qemu/bin/qemu-system-aarch64"
+            otool -L "$Q"
             echo "--- codesign ---"
-            codesign -dv --entitlements :- "$DIST_DIR/qemu/bin/qemu-system-aarch64" 2>&1 || true
+            codesign -dv --entitlements :- "$Q" 2>&1 || true
           } > "$DIST_DIR/qemu/BUILD-INFO.txt"
 
           tar -C "$DIST_DIR" -czf "$DIST_DIR/qemu-macos-arm64-virgl-spice.tar.gz" qemu
