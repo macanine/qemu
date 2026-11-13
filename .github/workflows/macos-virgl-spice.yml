@@ -148,7 +148,8 @@ jobs:
 
           # Confirm that the macOS GL path is compiled in and the dylibs are
           # actually linked, not merely present in the build tree.
-          strings "$Q" | grep -q 'gl=es'
+          strings "$Q" > "$RUNNER_TEMP/qemu.strings"
+          grep -q 'gl=es' "$RUNNER_TEMP/qemu.strings"
           otool -L "$Q" | grep -E 'virglrenderer|epoxy|EGL|GLES'
 
           # Start a paused VM with a SPICE server and verify the TCP port.
