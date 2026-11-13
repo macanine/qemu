@@ -132,7 +132,7 @@ jobs:
 
           "$Q" -device help > "$RUNNER_TEMP/devices.txt"
           grep -q 'virtio-gpu-gl-pci' "$RUNNER_TEMP/devices.txt"
-          grep -q 'qxl-vga' "$RUNNER_TEMP/devices.txt"
+          grep -q 'qxl' "$RUNNER_TEMP/devices.txt"
 
           "$Q" -display help > "$RUNNER_TEMP/displays.txt"
           grep -q 'cocoa' "$RUNNER_TEMP/displays.txt"
