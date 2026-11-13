@@ -27,8 +27,8 @@ env:
   HOMEBREW_NO_AUTO_UPDATE: 1
   HOMEBREW_NO_INSTALL_CLEANUP: 1
   HOMEBREW_NO_ANALYTICS: 1
-  QEMU_PREFIX: ${{ runner.temp }}/qemu-prefix
-  DIST_DIR: ${{ runner.temp }}/dist
+  QEMU_PREFIX: ${{ github.workspace }}/.ci-build/qemu-prefix
+  DIST_DIR: ${{ github.workspace }}/.ci-dist
 
 jobs:
   build:
@@ -216,8 +216,8 @@ jobs:
         with:
           name: qemu-macos-arm64-virgl-spice
           path: |
-            ${{ runner.temp }}/dist/qemu-macos-arm64-virgl-spice.tar.gz
-            ${{ runner.temp }}/dist/qemu-macos-arm64-virgl-spice.tar.gz.sha256
+            ${{ github.workspace }}/.ci-dist/qemu-macos-arm64-virgl-spice.tar.gz
+            ${{ github.workspace }}/.ci-dist/qemu-macos-arm64-virgl-spice.tar.gz.sha256
           if-no-files-found: error
           retention-days: 30
 
@@ -226,6 +226,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            ${{ runner.temp }}/dist/qemu-macos-arm64-virgl-spice.tar.gz
-            ${{ runner.temp }}/dist/qemu-macos-arm64-virgl-spice.tar.gz.sha256
+            ${{ github.workspace }}/.ci-dist/qemu-macos-arm64-virgl-spice.tar.gz
+            ${{ github.workspace }}/.ci-dist/qemu-macos-arm64-virgl-spice.tar.gz.sha256
           generate_release_notes: true
